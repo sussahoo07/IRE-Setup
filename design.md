@@ -1,927 +1,558 @@
-# Design Document: IRE (Isolated Recovery Environment) AWS Setup
+# AWS Isolated Recovery Environment (IRE) — Solution Design
 
-## Overview
-
-This document describes the architecture and implementation design for an Isolated Recovery Environment (IRE) on AWS, using a two-organization approach to achieve strong cyber recovery isolation. The Production AWS Organization runs all normal workloads, while a separate IRE AWS Organization provides a hardened, blast-radius-contained recovery environment that can be activated during a cyber incident.
-
-The design covers cross-organization connectivity, user authentication via AWS Identity Center (SSO), external integrations with JIRA and Azure DevOps, network topology, and the security controls necessary to keep the IRE operationally independent yet accessible when needed.
-
-The solution prioritises immutability, least-privilege access, and network segmentation so that a compromise of the Production Organization cannot propagate into the IRE Org. Recovery workflows are automated through Step Functions and pre-baked AMIs/snapshots stored in isolated vaults.
+**Document Type:** Technical Design Document  
+**Version:** 1.0  
+**Date:** November 2026  
+**Status:** Draft
 
 ---
 
-## Architecture
+## 1. Executive Summary
 
-### High-Level: Two-Organization Overview
-
-```mermaid
-graph TD
-    subgraph PROD_ORG["Production AWS Organization (Prod Org)"]
-        direction TB
-        PROD_MGMT["Management Account\n(Prod Org Root)"]
-        PROD_LOG["Log Archive Account"]
-        PROD_AUDIT["Security Audit Account"]
-        PROD_SHARED["Shared Services Account\n(Transit Gateway, DNS)"]
-        PROD_APP["Application Accounts\n(Workloads)"]
-        PROD_MGMT --> PROD_LOG
-        PROD_MGMT --> PROD_AUDIT
-        PROD_MGMT --> PROD_SHARED
-        PROD_MGMT --> PROD_APP
-    end
-
-    subgraph IRE_ORG["IRE AWS Organization (Cyber Recovery Org)"]
-        direction TB
-        IRE_MGMT["Management Account\n(IRE Org Root)"]
-        IRE_VAULT["Vault Account\n(Immutable Backups)"]
-        IRE_RECOVERY["Recovery Account\n(Workload Restore)"]
-        IRE_SECURITY["Security & Monitoring Account"]
-        IRE_SHARED["Shared Services Account\n(TGW, DNS, PrivateLink)"]
-        IRE_MGMT --> IRE_VAULT
-        IRE_MGMT --> IRE_RECOVERY
-        IRE_MGMT --> IRE_SECURITY
-        IRE_MGMT --> IRE_SHARED
-    end
-
-    subgraph IDENTITY["Identity Plane"]
-        IAM_IC_PROD["AWS Identity Center\n(Production Org)"]
-        IAM_IC_IRE["AWS Identity Center\n(IRE Org)"]
-        CORP_IDP["Corporate IdP\n(Azure AD / Okta)"]
-        CORP_IDP -->|SAML 2.0 / OIDC| IAM_IC_PROD
-        CORP_IDP -->|SAML 2.0 / OIDC| IAM_IC_IRE
-    end
-
-    subgraph EXTERNAL["External Integrations"]
-        JIRA["Atlassian JIRA\n(Incident Tracking)"]
-        ADO["Azure DevOps\n(CI/CD Pipelines)"]
-    end
-
-    PROD_SHARED <-->|"Cross-Org TGW Peering\n(Controlled, Audited)"| IRE_SHARED
-    PROD_APP -->|"Backup Replication\n(AWS Backup / S3 Replication)"| IRE_VAULT
-
-    IRE_RECOVERY -->|"JIRA REST API\n(PrivateLink / HTTPS)"| JIRA
-    IRE_RECOVERY -->|"ADO REST API\n(HTTPS)"| ADO
-
-    IAM_IC_PROD -.->|"Permission Sets"| PROD_APP
-    IAM_IC_IRE -.->|"Permission Sets"| IRE_RECOVERY
-```
-
-### Account Structure
-
-| Organization | Account | Purpose |
-|---|---|---|
-| **Production Org** | Management | Org root, SCPs, billing consolidation |
-| **Production Org** | Log Archive | Centralised CloudTrail, VPC Flow Logs, Config |
-| **Production Org** | Security Audit | GuardDuty delegated admin, Security Hub, Macie |
-| **Production Org** | Shared Services | Transit Gateway, Route 53 Resolver, DNS |
-| **Production Org** | Application Accounts | Production workloads (N accounts) |
-| **IRE Org** | Management | Org root, SCPs, billing for IRE |
-| **IRE Org** | Vault | AWS Backup vaults (immutable lock), S3 Object Lock |
-| **IRE Org** | Recovery | Workload restoration, forensic instances |
-| **IRE Org** | Security & Monitoring | GuardDuty, Security Hub, CloudTrail for IRE |
-| **IRE Org** | Shared Services | Transit Gateway, PrivateLink endpoints, DNS |
+This document describes the detailed technical design for the AWS Isolated Recovery Environment (IRE). The IRE is a clean-room AWS environment within the existing AWS Organization that provides independent recovery capability in the event of a compromise of Production (PROD) or Disaster Recovery (DR) environments. It is isolated at the identity, network, and security tooling layers.
 
 ---
 
-## Sequence Diagrams
+## 2. Architecture Overview
 
-### Cyber Recovery Activation Flow
+### 2.1 AWS Organization Layout
 
-```mermaid
-sequenceDiagram
-    participant SOC as SOC Analyst
-    participant JIRA as JIRA (Incident)
-    participant IC_IRE as Identity Center (IRE)
-    participant STEP as Step Functions (IRE)
-    participant VAULT as Vault Account
-    participant RECOVER as Recovery Account
-    participant ADO as Azure DevOps
-
-    SOC->>JIRA: Raise P1 Cyber Incident ticket
-    SOC->>IC_IRE: Authenticate via SSO (elevated role)
-    IC_IRE-->>SOC: Assume IRE-Recovery-Admin role
-    SOC->>STEP: Trigger IRE Activation workflow
-    STEP->>VAULT: Validate backup integrity (SHA-256 checksums)
-    VAULT-->>STEP: Backup verified
-    STEP->>RECOVER: Provision clean VPCs + restore AMIs from vault
-    RECOVER-->>STEP: Infrastructure ready
-    STEP->>JIRA: Update incident ticket (automated comment + status)
-    STEP->>ADO: Trigger clean-build pipeline (known-good commit)
-    ADO-->>RECOVER: Deploy application from clean source
-    STEP-->>SOC: Recovery environment ready notification (SNS/Email)
+```
+AWS Organization (Management Account)
+├── Root
+│   ├── OU: Production
+│   │   └── Account: PROD
+│   │         Identity: IAM Identity Center → Microsoft AD (federated)
+│   │         Network:  TGW, IGW, NAT GW
+│   │         SaaS:     Rubrik, CrowdStrike, Qualys, Tanium
+│   │
+│   ├── OU: DR
+│   │   └── Account: DR
+│   │         Identity: IAM Identity Center → Microsoft AD (federated)
+│   │         Network:  TGW attachment to PROD TGW
+│   │
+│   └── OU: IRE                          ◄── New OU
+│       ├── Account: IRE-Core            (recovery workloads, validation)
+│       └── Account: IRE-Security        (logging, monitoring, alerting)
 ```
 
-### Normal Backup Replication Flow (Steady State)
+### 2.2 Component Map
 
-```mermaid
-sequenceDiagram
-    participant PROD as Production Account
-    participant BACKUP as AWS Backup (Prod)
-    participant VAULT as Vault Account (IRE)
-    participant S3LOCK as S3 Object Lock Bucket
-
-    PROD->>BACKUP: Scheduled backup job (EBS, RDS, EFS)
-    BACKUP->>BACKUP: Encrypt with Prod KMS key
-    BACKUP->>VAULT: Cross-account, cross-org copy
-    VAULT->>VAULT: Re-encrypt with IRE KMS key
-    VAULT->>S3LOCK: Write manifest + checksum (WORM)
-    S3LOCK-->>VAULT: Object locked (Compliance mode, 90d)
-    VAULT-->>BACKUP: Replication acknowledged
-```
-
-### User Authentication Flow (AWS Identity Center)
-
-```mermaid
-sequenceDiagram
-    participant USER as Engineer/Operator
-    participant IDP as Corporate IdP (Azure AD)
-    participant IC as AWS Identity Center
-    participant STS as AWS STS
-    participant ACCT as Target AWS Account
-
-    USER->>IC: Access AWS access portal URL
-    IC->>IDP: Redirect for SAML 2.0 authentication
-    IDP->>IDP: MFA challenge (TOTP/FIDO2)
-    IDP-->>IC: SAML assertion (user + group attributes)
-    IC->>IC: Map groups → Permission Sets → Accounts
-    USER->>IC: Select target account + role
-    IC->>STS: AssumeRoleWithSAML
-    STS-->>USER: Temporary credentials (1h max session)
-    USER->>ACCT: API/Console access with scoped credentials
-```
-
----
-
-## Components and Interfaces
-
-### Component 1: AWS Organizations & SCPs
-
-**Purpose**: Enforce guardrails at the organization level to prevent accidental or malicious changes that would compromise recovery isolation.
-
-**Interface** (SCP Policy Attachment):
-```json
-{
-  "OrganizationId": "o-xxxxxxxxxxxx",
-  "PolicyType": "SERVICE_CONTROL_POLICY",
-  "Targets": ["ou-xxxx-xxxxxxxx"],
-  "PolicyDocument": { "Version": "2012-10-17", "Statement": [...] }
-}
-```
-
-**Responsibilities**:
-- Deny deletion of CloudTrail, Config, and GuardDuty in all accounts
-- Deny disabling S3 Object Lock in the Vault account
-- Deny VPC peering from IRE accounts to any non-approved CIDR
-- Deny creation of IAM users (enforce SSO-only access)
-- Enforce AWS Backup vault lock cannot be deleted for minimum 90 days
-- Restrict which AWS regions can be used (reduce attack surface)
-
----
-
-### Component 2: AWS Identity Center (SSO)
-
-**Purpose**: Centralised human identity management for both organizations using a shared corporate IdP.
-
-**Interface** (Permission Set):
-```json
-{
-  "Name": "IRE-Recovery-Admin",
-  "SessionDuration": "PT1H",
-  "ManagedPolicies": ["arn:aws:iam::aws:policy/AdministratorAccess"],
-  "InlinePolicy": {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Sid": "DenyIREVaultDelete",
-        "Effect": "Deny",
-        "Action": ["backup:DeleteBackupVault", "s3:DeleteObject"],
-        "Resource": "*"
-      }
-    ]
-  },
-  "AccountAssignments": [
-    { "AccountId": "IRE_RECOVERY_ACCOUNT_ID", "PrincipalType": "GROUP", "PrincipalId": "IRE-Recovery-Team-Group-Id" }
-  ]
-}
-```
-
-**Responsibilities**:
-- Single sign-on entry point for both Production Org and IRE Org
-- SAML 2.0 / SCIM integration with corporate IdP (Azure AD/Okta)
-- Just-in-time access provisioning via group membership
-- Permission Sets define least-privilege role boundaries
-- Separate Identity Center instances per organization (each org has its own)
-- Break-glass accounts with hardware MFA for emergency access
-
----
-
-### Component 3: Transit Gateway & Cross-Org Peering
-
-**Purpose**: Controlled network path between Production and IRE, used only for backup replication and authorized recovery operations.
-
-**Interface** (TGW Peering Attachment):
-```json
-{
-  "PeerAccountId": "IRE_SHARED_SERVICES_ACCOUNT_ID",
-  "PeerRegion": "ap-southeast-2",
-  "PeerTransitGatewayId": "tgw-xxxxxxxxxxxxxxx",
-  "Tags": [{ "Key": "Purpose", "Value": "IRE-Replication-Only" }]
-}
-```
-
-**Responsibilities**:
-- Accepts only specific source CIDRs (backup replication subnets)
-- Route tables are locked — only backup subnets routed to IRE side
-- No return route from IRE to Production workload subnets
-- VPC Flow Logs enabled on all attachments
-- TGW route tables use explicit deny for non-approved prefixes
-
----
-
-### Component 4: AWS Backup & Vault
-
-**Purpose**: Immutable, encrypted backup storage that survives a compromise of the Production environment.
-
-**Interface** (Backup Plan):
-```json
-{
-  "BackupPlanName": "IRE-Daily-Backup",
-  "Rules": [
-    {
-      "RuleName": "DailyBackup",
-      "ScheduleExpression": "cron(0 2 * * ? *)",
-      "StartWindowMinutes": 60,
-      "Lifecycle": { "DeleteAfterDays": 90 },
-      "CopyActions": [
-        {
-          "DestinationBackupVaultArn": "arn:aws:backup:ap-southeast-2:IRE_VAULT_ACCOUNT:backup-vault:IRE-ImmutableVault",
-          "Lifecycle": { "DeleteAfterDays": 365 }
-        }
-      ]
-    }
-  ]
-}
-```
-
-**Responsibilities**:
-- Backup EBS volumes, RDS clusters, EFS file systems, DynamoDB tables
-- Cross-account and cross-organization copy to IRE Vault account
-- Vault Lock in Compliance mode (minimum 90-day retention, cannot be deleted)
-- Re-encryption with IRE-managed KMS key on copy
-- Integrity validation via SHA-256 checksums stored in S3 (Object Lock)
-
----
-
-### Component 5: JIRA Integration
-
-**Purpose**: Automate incident tracking and recovery workflow status updates from within IRE.
-
-**Interface** (JIRA REST API via PrivateLink):
-```json
-{
-  "endpoint": "https://jira.company.internal/rest/api/3/issue",
-  "auth": "Bearer ${secrets_manager_token}",
-  "payload": {
-    "fields": {
-      "project": { "key": "CYB" },
-      "summary": "IRE Activation - Incident ${INCIDENT_ID}",
-      "issuetype": { "name": "Incident" },
-      "priority": { "name": "Critical" },
-      "customfield_10001": "${recovery_runbook_url}"
-    }
-  }
-}
-```
-
-**Responsibilities**:
-- Create/update incident tickets automatically from Step Functions
-- Transition ticket workflow states (Investigating → Recovering → Resolved)
-- Attach recovery artefacts (logs, screenshots) to ticket
-- Connectivity via AWS PrivateLink (Atlassian Connect) or Site-to-Site VPN to corporate network
-- Credentials stored in AWS Secrets Manager (IRE Recovery Account), rotated every 30 days
-
----
-
-### Component 6: Azure DevOps Integration
-
-**Purpose**: Trigger clean-build pipelines from known-good source code during recovery, ensuring no compromised artefacts are deployed.
-
-**Interface** (Azure DevOps REST API):
-```json
-{
-  "endpoint": "https://dev.azure.com/{org}/{project}/_apis/pipelines/{pipelineId}/runs",
-  "auth": "Bearer ${secrets_manager_ado_pat}",
-  "payload": {
-    "resources": {
-      "repositories": {
-        "self": { "refName": "refs/heads/main", "version": "${CLEAN_COMMIT_SHA}" }
-      }
-    },
-    "variables": {
-      "TARGET_ENV": { "value": "IRE" },
-      "DEPLOY_ACCOUNT": { "value": "${IRE_RECOVERY_ACCOUNT_ID}" }
-    }
-  }
-}
-```
-
-**Responsibilities**:
-- Receive webhook triggers from AWS Step Functions (outbound HTTPS)
-- Build application from a pinned clean commit SHA (verified against code signing)
-- Deploy build artefacts to IRE Recovery Account only
-- Azure DevOps service connection uses IAM role via OIDC (no long-lived keys)
-- Pipeline results posted back to Step Functions via callback token (SQS)
-
----
-
-## Data Models
-
-### IRE Activation Event
-
-```json
-{
-  "eventType": "IRE_ACTIVATION",
-  "incidentId": "string (UUID)",
-  "activatedBy": "string (IAM principal ARN)",
-  "activatedAt": "string (ISO 8601 timestamp)",
-  "severity": "P1 | P2",
-  "affectedAccounts": ["string (AWS account IDs)"],
-  "backupPointInTime": "string (ISO 8601 timestamp)",
-  "recoveryObjective": {
-    "rto_hours": "number",
-    "rpo_hours": "number"
-  },
-  "status": "INITIATED | VALIDATING | PROVISIONING | DEPLOYING | READY | FAILED",
-  "jiraTicketId": "string",
-  "recoveryAccountId": "string (AWS account ID)"
-}
-```
-
-**Validation Rules**:
-- `incidentId` must be globally unique (UUIDv4)
-- `activatedBy` must match an allowed IAM principal pattern
-- `backupPointInTime` must be within the last 90 days
-- `rto_hours` must be ≤ 4 for P1 severity
-- `status` transitions are strictly ordered (no backward transitions)
-
----
-
-### Backup Record
-
-```json
-{
-  "backupId": "string (ARN)",
-  "sourceAccountId": "string",
-  "resourceType": "EBS | RDS | EFS | DynamoDB",
-  "resourceArn": "string",
-  "completedAt": "string (ISO 8601)",
-  "sizeBytes": "number",
-  "encryptionKeyArn": "string (KMS ARN)",
-  "checksum": {
-    "algorithm": "SHA-256",
-    "value": "string (hex)"
-  },
-  "vaultArn": "string",
-  "retentionExpiresAt": "string (ISO 8601)",
-  "locked": "boolean",
-  "validatedAt": "string (ISO 8601 | null)"
-}
-```
-
-**Validation Rules**:
-- `checksum.value` verified before any restore operation begins
-- `locked` must be `true` for all records in IRE Vault
-- `retentionExpiresAt` must be ≥ 90 days from `completedAt`
-
----
-
-### Permission Set Assignment
-
-```json
-{
-  "principalType": "USER | GROUP",
-  "principalId": "string (Identity Center entity ID)",
-  "permissionSetArn": "string",
-  "accountId": "string",
-  "organization": "PROD | IRE",
-  "grantedAt": "string (ISO 8601)",
-  "expiresAt": "string (ISO 8601 | null)",
-  "justification": "string",
-  "approvedBy": "string"
-}
-```
-
-**Validation Rules**:
-- IRE `IRE-Recovery-Admin` assignments must have `expiresAt` ≤ 8h from `grantedAt`
-- `justification` is mandatory for all IRE Recovery Account assignments
-- All assignments logged to CloudTrail and JIRA incident ticket
-
----
-
-## Algorithmic Pseudocode
-
-### IRE Activation Workflow (Step Functions)
-
-```pascal
-ALGORITHM ActivateIRE(activationRequest)
-INPUT:  activationRequest of type IREActivationEvent
-OUTPUT: activationResult of type ActivationResult
-
-BEGIN
-  ASSERT activationRequest.incidentId IS NOT NULL
-  ASSERT activationRequest.severity IN ["P1", "P2"]
-  
-  // Step 1: Validate caller authorization
-  callerPrincipal ← GetCallerIdentity()
-  IF callerPrincipal NOT IN AllowedIREActivators THEN
-    RETURN Error("Unauthorized: Caller not permitted to activate IRE")
-  END IF
-  
-  // Step 2: Create JIRA incident ticket
-  jiraTicket ← JIRA.CreateIssue(
-    project := "CYB",
-    summary := "IRE Activation - " + activationRequest.incidentId,
-    priority := activationRequest.severity
-  )
-  activationRequest.jiraTicketId ← jiraTicket.id
-  
-  // Step 3: Validate backup integrity
-  FOR each resourceArn IN activationRequest.affectedAccounts.resources DO
-    ASSERT ActivationStatus IS VALIDATING
-    
-    backup ← Vault.GetLatestBackup(resourceArn, activationRequest.backupPointInTime)
-    
-    IF backup IS NULL THEN
-      JIRA.AddComment(jiraTicket.id, "No backup found for " + resourceArn)
-      RETURN Error("No backup found for resource: " + resourceArn)
-    END IF
-    
-    checksum ← Vault.ComputeChecksum(backup)
-    IF checksum NOT EQUALS backup.storedChecksum THEN
-      RETURN Error("Checksum mismatch for backup: " + backup.backupId)
-    END IF
-  END FOR
-  
-  // Step 4: Provision clean network infrastructure
-  activationRequest.status ← PROVISIONING
-  vpcConfig ← NetworkTemplate.Deploy(account := IRE_RECOVERY_ACCOUNT)
-  JIRA.AddComment(jiraTicket.id, "Clean VPCs provisioned: " + vpcConfig.vpcIds)
-  
-  // Step 5: Restore workloads from validated backups
-  FOR each backup IN validatedBackups DO
-    ASSERT allPreviousRestoresSucceeded()
-    
-    restoreJob ← AWSBackup.StartRestoreJob(
-      backupId := backup.backupId,
-      targetAccountId := IRE_RECOVERY_ACCOUNT,
-      targetVpcId := vpcConfig.primaryVpcId
-    )
-    WaitForCompletion(restoreJob, timeoutMinutes := 120)
-  END FOR
-  
-  // Step 6: Trigger clean build pipeline in Azure DevOps
-  activationRequest.status ← DEPLOYING
-  adoPipelineRun ← AzureDevOps.TriggerPipeline(
-    pipelineId := config.adoPipelineId,
-    commitSha  := activationRequest.cleanCommitSha,
-    targetEnv  := "IRE"
-  )
-  WaitForPipelineCallback(adoPipelineRun.callbackToken, timeoutMinutes := 60)
-  
-  // Step 7: Final validation and notification
-  activationRequest.status ← READY
-  JIRA.TransitionIssue(jiraTicket.id, transition := "Recovery Ready")
-  SNS.Publish(topic := IRE_NOTIFICATIONS_TOPIC, message := "IRE is READY for operations")
-  
-  RETURN ActivationResult(status := SUCCESS, jiraTicketId := jiraTicket.id)
-END
-```
-
-**Preconditions:**
-- Caller has assumed `IRE-Recovery-Admin` permission set via Identity Center
-- Vault account is reachable and Vault Lock is active
-- Step Functions execution role has cross-account backup read access
-- IRE Recovery Account has capacity for workload restoration
-
-**Postconditions:**
-- JIRA ticket created and updated at each workflow step
-- All backup checksums verified before any restore begins
-- Clean VPCs provisioned with no routes to Production networks
-- Azure DevOps pipeline triggered with pinned clean commit SHA
-- SNS notification sent to SOC team on completion
-
-**Loop Invariants:**
-- For each resource loop: All previously validated backups have verified checksums
-- For each restore loop: All previously restored workloads are healthy before next restore begins
-
----
-
-### Backup Integrity Validation Algorithm
-
-```pascal
-ALGORITHM ValidateBackupIntegrity(backupRecord)
-INPUT:  backupRecord of type BackupRecord
-OUTPUT: isValid of type Boolean
-
-BEGIN
-  // Check lock status — reject unlocked backups
-  IF backupRecord.locked = FALSE THEN
-    RETURN FALSE
-  END IF
-  
-  // Check retention has not expired
-  IF backupRecord.retentionExpiresAt < CurrentTimestamp() THEN
-    RETURN FALSE
-  END IF
-  
-  // Download manifest from S3 Object Lock store
-  manifest ← S3.GetObject(
-    bucket := IRE_MANIFEST_BUCKET,
-    key    := backupRecord.backupId + "/manifest.json"
-  )
-  
-  IF manifest IS NULL THEN
-    RETURN FALSE
-  END IF
-  
-  // Recompute checksum against manifest
-  actualChecksum ← ComputeSHA256(backupRecord)
-  
-  IF actualChecksum NOT EQUALS manifest.checksum.value THEN
-    CloudWatch.PutMetric(name := "BackupChecksumMismatch", value := 1)
-    SNS.Publish(topic := SECURITY_ALERTS_TOPIC, message := "Checksum mismatch: " + backupRecord.backupId)
-    RETURN FALSE
-  END IF
-  
-  // Mark as validated
-  backupRecord.validatedAt ← CurrentTimestamp()
-  RETURN TRUE
-END
-```
-
-**Preconditions:**
-- `backupRecord` is non-null with all required fields populated
-- S3 manifest bucket is accessible from IRE Recovery account
-- CloudWatch and SNS permissions are available
-
-**Postconditions:**
-- Returns `TRUE` only if backup is locked, within retention, and checksum matches
-- On mismatch: CloudWatch metric emitted, SNS alert published
-- `validatedAt` updated on successful validation
-
----
-
-### Cross-Org Network Connectivity Algorithm
-
-```pascal
-ALGORITHM EstablishCrossOrgPath(sourceAccount, targetVaultSubnet)
-INPUT:  sourceAccount of type AWSAccount (Production)
-        targetVaultSubnet of type SubnetCIDR (IRE Vault)
-OUTPUT: routeStatus of type ConnectivityResult
-
-BEGIN
-  // Step 1: Verify TGW peering attachment is active
-  peeringAttachment ← TGW.DescribePeeringAttachment(
-    localTgwId  := PROD_TGW_ID,
-    peerTgwId   := IRE_TGW_ID
-  )
-  
-  IF peeringAttachment.state NOT EQUALS "available" THEN
-    RETURN ConnectivityResult(status := FAILED, reason := "TGW peering not active")
-  END IF
-  
-  // Step 2: Validate route table allows only backup subnet CIDRs
-  routeTable ← TGW.GetRouteTable(id := PROD_TGW_REPLICATION_RT)
-  
-  FOR each route IN routeTable.routes DO
-    IF route.destination NOT IN APPROVED_BACKUP_CIDRS THEN
-      RETURN ConnectivityResult(status := FAILED, reason := "Unapproved route detected: " + route.destination)
-    END IF
-  END FOR
-  
-  // Step 3: Verify Security Group allows outbound to Vault only
-  sg ← EC2.DescribeSecurityGroup(id := BACKUP_SG_ID, account := sourceAccount)
-  
-  IF sg.outboundRules NOT CONTAINS (port := 443, destination := targetVaultSubnet) THEN
-    RETURN ConnectivityResult(status := FAILED, reason := "Security group missing required outbound rule")
-  END IF
-  
-  // Step 4: Confirm VPC Flow Logs are active
-  flowLogs ← EC2.DescribeFlowLogs(vpcId := sourceAccount.backupVpcId)
-  
-  IF flowLogs.status NOT EQUALS "ACTIVE" THEN
-    RETURN ConnectivityResult(status := FAILED, reason := "VPC Flow Logs not active")
-  END IF
-  
-  RETURN ConnectivityResult(status := SUCCESS, path := peeringAttachment.attachmentId)
-END
-```
-
----
-
-## Network Topology
-
-### VPC and Subnet Design
-
-```mermaid
-graph TD
-    subgraph PROD_VPC["Production VPC (10.0.0.0/16)"]
-        PROD_APP_SN["App Subnets\n10.0.1.0/24 - 10.0.3.0/24\n(Private)"]
-        PROD_BACKUP_SN["Backup Replication Subnet\n10.0.10.0/28\n(Private, egress to IRE only)"]
-        PROD_IGW["Internet Gateway"]
-        PROD_NATGW["NAT Gateway"]
-        PROD_APP_SN --> PROD_NATGW
-        PROD_NATGW --> PROD_IGW
-    end
-
-    subgraph IRE_VAULT_VPC["IRE Vault VPC (172.16.0.0/16)"]
-        VAULT_SN["Vault Subnets\n172.16.1.0/24\n(Private, no IGW)"]
-        VAULT_VPE["VPC Endpoint\n(backup, s3, kms)"]
-        VAULT_SN --> VAULT_VPE
-    end
-
-    subgraph IRE_RECOVERY_VPC["IRE Recovery VPC (172.17.0.0/16)"]
-        RECOVER_SN["Recovery Subnets\n172.17.1.0/24 - 172.17.3.0/24\n(Private)"]
-        RECOVER_VPE["VPC Endpoints\n(ssm, ec2, s3, backup,\nsecretmgr, step-fn)"]
-        RECOVER_NATGW["NAT Gateway\n(Egress to JIRA/ADO)"]
-        RECOVER_SN --> RECOVER_VPE
-        RECOVER_SN --> RECOVER_NATGW
-    end
-
-    PROD_BACKUP_SN <-->|"TGW Replication RT\n(CIDR: 172.16.0.0/16 only)"| VAULT_SN
-    VAULT_SN -.->|"Internal VPC Peering\n(IRE Org only)"| RECOVER_SN
-```
-
-### Transit Gateway Route Tables
-
-| Route Table | Attached VPCs | Routes | Purpose |
+| Component | Service | Account | Purpose |
 |---|---|---|---|
-| `prod-tgw-replication-rt` | Prod Backup VPC | `172.16.0.0/16 → IRE TGW Peering` | Backup replication path |
-| `ire-tgw-vault-rt` | IRE Vault VPC | `10.0.10.0/28 → Prod TGW Peering` | Accept replication from Prod |
-| `ire-tgw-recovery-rt` | IRE Recovery VPC | `172.16.0.0/16 → IRE Vault VPC` | Recovery reads from Vault |
-
-**Explicit denies**: No route from IRE Recovery VPC to any Production CIDR (10.0.0.0/8).
+| Recovery Administrator Identity | IAM Identity Center (local) | IRE OU | Independent authentication |
+| Recovery VPC | Amazon VPC | IRE-Core | Isolated network boundary |
+| VPC Endpoints | AWS PrivateLink | IRE-Core | AWS service access without internet |
+| Backup Vault | AWS Backup | IRE-Core | Immutable recovery point storage |
+| Replicated Data | S3 + Object Lock | IRE-Core | Backup data from PROD |
+| Encryption Keys | AWS KMS CMKs | IRE-Core, IRE-Security | IRE-exclusive data encryption |
+| Threat Detection | Amazon GuardDuty | IRE-Security | Replace CrowdStrike |
+| Vulnerability Scanning | Amazon Inspector v2 | IRE-Core | Replace Qualys |
+| Patch Management | AWS Systems Manager | IRE-Core | Replace Tanium |
+| Audit Logging | AWS CloudTrail | IRE-Security | Independent audit trail |
+| Configuration Compliance | AWS Config | IRE-Security | Isolation rule enforcement |
+| Security Aggregation | AWS Security Hub | IRE-Security | Independent security posture |
+| Alerting | Amazon SNS | IRE-Security | Decoupled notifications |
 
 ---
 
-## Key Functions with Formal Specifications
+## 3. Identity and Authentication Design
 
-### Function: ValidateIREReadiness()
+### 3.1 IAM Identity Center — Standalone Instance
 
-```pascal
-FUNCTION ValidateIREReadiness() RETURNS ReadinessReport
+A separate IAM Identity Center instance is enabled and delegated to the `IRE-Security` account. This instance is completely independent of the PROD IAM Identity Center instance.
+
+```
+PROD IAM Identity Center                IRE IAM Identity Center
+─────────────────────────               ──────────────────────────
+Identity Source: Microsoft AD           Identity Source: Built-in
+Federation: SAML 2.0 / SCIM            Federation: NONE
+Users: AD-synced                        Users: Manually provisioned
+MFA: AD-controlled                      MFA: TOTP enforced (hardware preferred)
+Admin: PROD Cloud Platform team         Admin: IRE-Security account role only
 ```
 
-**Preconditions:**
-- Called from IRE Security & Monitoring account
-- CloudWatch metrics available for all IRE accounts
+### 3.2 IAM Identity Center Permission Sets
 
-**Postconditions:**
-- Returns report with pass/fail for each check
-- If any critical check fails, SNS alert is raised
-- Report written to S3 for audit trail
+| Permission Set | Policies | Assigned Accounts | Assigned Group |
+|---|---|---|---|
+| `IRE-RecoveryAdmin` | `AdministratorAccess` | IRE-Core | IRE Recovery Admins |
+| `IRE-SecurityAdmin` | `AdministratorAccess` | IRE-Security | IRE Security Admins |
+| `IRE-ReadOnly` | `ReadOnlyAccess` | IRE-Core, IRE-Security | IRE Auditors |
+| `IRE-NetworkAdmin` | Custom: EC2/VPC/Route53 | IRE-Core | IRE Network Team |
 
-**Checks Performed:**
-1. Vault Lock status = COMPLIANCE_MODE
-2. All VPC Flow Logs = ACTIVE
-3. GuardDuty = ENABLED across all IRE accounts
-4. No IAM users exist in any IRE account (SSO-only)
-5. SCPs are attached and not modified in last 24h
-6. Backup replication lag < 24h for all protected resources
+### 3.3 Break-Glass Procedure
 
----
-
-### Function: GrantTemporaryIREAccess()
-
-```pascal
-FUNCTION GrantTemporaryIREAccess(principal, justification, durationHours)
-RETURNS AccessGrant
+```
+Step 1: CISO or delegate authorizes IRE activation
+Step 2: Two designated custodians retrieve physical envelope from vault
+Step 3: IAM Identity Center local user credentials extracted
+Step 4: Login to IRE Identity Center portal (separate URL)
+Step 5: TOTP hardware token used for MFA
+Step 6: SNS alert fires automatically upon console login (CloudTrail → EventBridge → SNS)
+Step 7: Post-use: credentials rotated immediately
 ```
 
-**Preconditions:**
-- `principal` is a valid Identity Center group or user
-- `durationHours` ≤ 8
-- `justification` is non-empty and references a valid JIRA ticket
+### 3.4 IAM Role Design (IRE-Core)
 
-**Postconditions:**
-- Permission Set assignment created with `expiresAt = now() + durationHours`
-- JIRA ticket updated with access grant details
-- CloudTrail event emitted
-- Slack/SNS notification sent to security team
+```
+IRE-Core Account IAM Roles (assumed via IAM Identity Center permission sets):
 
----
+arn:aws:iam::<IRE-Core>:role/IRE-RecoveryAdmin-Role
+  Trust: IAM Identity Center SAML provider (IRE instance only)
+  Permissions: AdministratorAccess
 
-## Error Handling
+arn:aws:iam::<IRE-Core>:role/IRE-BackupRestoreRole
+  Trust: AWS Backup service principal
+  Permissions: Backup restore, EC2 AMI launch, EBS snapshot restore
 
-### Scenario 1: Backup Checksum Mismatch
-
-**Condition**: Stored SHA-256 checksum does not match recomputed checksum during IRE activation.
-
-**Response**:
-- IRE activation workflow halted immediately
-- CloudWatch alarm raised (`BackupIntegrityAlarm`)
-- SNS notification to Security team and SOC
-- JIRA ticket status updated to "Blocked - Backup Integrity Failure"
-
-**Recovery**:
-- Security team investigates backup integrity breach
-- Attempt restore from next-oldest valid backup
-- If all backups compromised, escalate to DR runbook
+arn:aws:iam::<IRE-Core>:role/IRE-SSMInstanceRole
+  Trust: EC2 instance profile
+  Permissions: SSM core + CloudWatch Logs write
+```
 
 ---
 
-### Scenario 2: TGW Cross-Org Connectivity Failure
+## 4. Network Design
 
-**Condition**: TGW peering attachment is not active or route tables have been modified.
+### 4.1 IRE VPC Layout
 
-**Response**:
-- Backup replication health check fails (CloudWatch alarm)
-- EventBridge rule triggers Lambda to attempt TGW attachment refresh
-- Alert sent to Network Operations team
+```
+Region: ap-southeast-1 (or as designated)
 
-**Recovery**:
-- Lambda re-applies correct route table configuration from Terraform state
-- If persistent, escalate to AWS Support (Network specialist)
+IRE VPC: 10.200.0.0/16
+├── Subnet: ire-private-a  10.200.1.0/24  AZ-a
+├── Subnet: ire-private-b  10.200.2.0/24  AZ-b
+└── Subnet: ire-endpoint-a 10.200.3.0/24  AZ-a  (VPC Endpoint ENIs)
+    Subnet: ire-endpoint-b 10.200.4.0/24  AZ-b  (VPC Endpoint ENIs)
 
----
+Route Tables:
+  ire-private-rt:
+    Destination: 10.200.0.0/16  Target: local
+    (NO default route — no IGW, no NAT GW, no TGW)
+```
 
-### Scenario 3: Identity Center SSO Failure During Incident
+### 4.2 VPC Endpoints Specification
 
-**Condition**: Corporate IdP (Azure AD) unavailable during a cyber incident, blocking SSO to IRE.
+| Endpoint | Type | Service | Used By |
+|---|---|---|---|
+| `vpce-s3` | Gateway | com.amazonaws.region.s3 | All (S3 access) |
+| `vpce-ssm` | Interface | com.amazonaws.region.ssm | EC2 instances (SSM) |
+| `vpce-ssmmessages` | Interface | com.amazonaws.region.ssmmessages | EC2 instances (Session Manager) |
+| `vpce-ec2messages` | Interface | com.amazonaws.region.ec2messages | EC2 instances |
+| `vpce-ec2` | Interface | com.amazonaws.region.ec2 | Recovery operations |
+| `vpce-kms` | Interface | com.amazonaws.region.kms | Encryption/decryption |
+| `vpce-secretsmanager` | Interface | com.amazonaws.region.secretsmanager | Secrets retrieval |
+| `vpce-logs` | Interface | com.amazonaws.region.logs | CloudWatch Logs |
+| `vpce-sts` | Interface | com.amazonaws.region.sts | Role assumption |
+| `vpce-backup` | Interface | com.amazonaws.region.backup | AWS Backup operations |
+| `vpce-backup-gateway` | Interface | com.amazonaws.region.backup-gateway | Backup gateway |
 
-**Response**:
-- Break-glass accounts activated (hardware MFA protected, stored in physical safe)
-- Break-glass usage automatically triggers CloudWatch alarm and JIRA ticket
-- All actions during break-glass period logged with enhanced verbosity
+### 4.3 Security Group Rules
 
-**Recovery**:
-- IdP restored, break-glass accounts immediately de-activated
-- Post-incident review of all break-glass actions
+**sg-ire-endpoints** (attached to VPC endpoint ENIs):
+```
+Inbound:
+  Allow HTTPS (443) from 10.200.0.0/16
 
----
+Outbound:
+  Deny All
+```
 
-### Scenario 4: Azure DevOps Pipeline Failure During Recovery
+**sg-ire-workloads** (attached to recovery EC2 instances):
+```
+Inbound:
+  Allow all from 10.200.0.0/16 (intra-VPC)
 
-**Condition**: ADO pipeline fails to build or deploy to IRE Recovery Account.
+Outbound:
+  Allow HTTPS (443) to 10.200.3.0/24, 10.200.4.0/24 (endpoint subnets)
+  Deny All other outbound
+```
 
-**Response**:
-- Step Functions task catches error, marks deployment step as FAILED
-- JIRA ticket updated with pipeline run URL and error logs
-- SNS alert to DevOps team
+### 4.4 Network Isolation Enforcement (SCP)
 
-**Recovery**:
-- Manual re-trigger via Step Functions console (with approved justification)
-- Fallback: deploy last known-good artefact from S3 artefact store in IRE
+The following actions are denied at the OU level via SCP `IRE-DenyNetworkExposure`:
 
----
-
-## Testing Strategy
-
-### Unit Testing Approach
-
-Test individual Lambda functions and Step Functions states in isolation:
-- Backup validation logic (checksum matching, lock status checks)
-- JIRA API client (mock JIRA responses, error handling)
-- Azure DevOps API client (mock pipeline trigger and callback)
-- Identity Center permission set assignment/revocation logic
-
-Key test cases:
-- Checksum mismatch returns `FALSE` and emits CloudWatch metric
-- Expired retention returns `FALSE` without checksum computation
-- JIRA API 401 triggers Secrets Manager rotation and retry once
-- Step Functions catches ADO pipeline timeout and transitions to FAILED state
-
-### Property-Based Testing Approach
-
-**Property Test Library**: `hypothesis` (Python) or `fast-check` (TypeScript)
-
-Properties to verify:
-- **Idempotency**: Running `ValidateBackupIntegrity` twice on the same record always returns the same result
-- **No-regression**: `GrantTemporaryIREAccess` with `durationHours > 8` always returns an error, for all valid principal inputs
-- **Route isolation**: For all possible route table configurations, no path exists from IRE Recovery VPC to Production workload subnets
-- **Status monotonicity**: IRE activation status transitions are strictly forward (no backward transitions for any sequence of events)
-
-### Integration Testing Approach
-
-- End-to-end activation test in a dedicated test IRE account (non-production)
-- JIRA sandbox used for integration tests
-- Azure DevOps non-production pipeline for deployment verification
-- Quarterly game-day exercises to validate the full recovery workflow under simulated conditions
+```json
+Denied Actions:
+  ec2:AttachInternetGateway
+  ec2:CreateInternetGateway
+  ec2:CreateNatGateway
+  ec2:CreateVpcPeeringConnection
+  ec2:AcceptVpcPeeringConnection
+  ec2:CreateTransitGatewayVpcAttachment
+  ec2:AcceptTransitGatewayVpcAttachment
+  ram:AcceptResourceShareInvitation  (from non-IRE accounts)
+```
 
 ---
 
-## Security Considerations
+## 5. Data Replication Design
 
-### Blast Radius Containment
+### 5.1 S3 Cross-Account Replication
 
-- IRE Org has no trust relationship with Production Org (separate root accounts)
-- SCPs in IRE Org prevent any account from accepting peering from non-approved CIDRs
-- IAM Resource Control Policies (RCPs) restrict S3 bucket access to IRE accounts only
-- KMS keys in IRE are non-exportable and cannot be shared with Production accounts
+```
+PROD Account                              IRE-Core Account
+─────────────────────────────────────     ────────────────────────────────────
+S3 Bucket: prod-backup-data               S3 Bucket: ire-backup-data-<acct-id>
+  Replication Rule:                         Bucket Policy:
+    Destination: ire-backup-data             - Allow s3:PutObject from
+    Encryption: IRE KMS CMK                    arn:aws:iam::PROD:role/BackupRole
+    Storage Class: S3 Standard-IA             - Deny s3:DeleteObject from *
+                                              - Deny s3:PutObject from non-PROD
+                                            Object Lock: Governance mode
+                                            Retention: 365 days minimum
+                                            Encryption: ire-s3-cmk (KMS)
+```
 
-### Data Protection
+### 5.2 AWS Backup Cross-Account Copy
 
-- All backups encrypted at rest with IRE-managed KMS keys (Customer Managed Keys)
-- All cross-org traffic encrypted in transit (TLS 1.2+, VPN if required)
-- S3 buckets in IRE have: bucket policies restricting access, no public ACLs, Object Lock enabled
-- Vault Lock in Compliance mode prevents even root from deleting backups before retention expires
+```
+Management Account — Backup Policy
+  Source Vault:  PROD Backup Vault
+  Destination:   ire-backup-vault (IRE-Core account)
+  Copy Role:     arn:aws:iam::PROD:role/BackupCrossAcctRole
+  Schedule:      Daily (aligned to PROD backup window)
 
-### Detection & Response
+IRE-Core Account — Backup Vault
+  Vault Name:    ire-backup-vault
+  Encryption:    ire-backup-cmk (KMS)
+  Vault Lock:    Compliance mode, min 365 days
+  Access Policy: Deny all delete actions from all principals
+```
 
-- GuardDuty enabled in all IRE accounts with threat intel feeds
-- Security Hub aggregating findings from GuardDuty, Config, Inspector, Macie
-- CloudTrail with log integrity validation (SHA-256 digest files)
-- Config Rules enforcing: no IAM users, required tags, no open security groups, VPC Flow Logs active
-- EventBridge → Lambda auto-remediation for common misconfigurations
+### 5.3 AMI Replication
 
-### Privileged Access Management
+```
+PROD Account
+  1. Create AMI from EC2 instance
+  2. Share AMI with IRE-Core account (temporary)
 
-- No long-lived IAM access keys anywhere in the IRE Org
-- All human access via Identity Center (SAML) with max 1-hour session
-- IRE Recovery Admin role requires time-limited assignment with JIRA ticket reference
-- AWS Systems Manager Session Manager for EC2 access (no SSH key pairs)
-- Privileged actions (Vault deletion attempts, SCP changes) trigger immediate SNS alerts
+IRE-Core Account
+  3. Copy AMI: ec2:CopyImage (re-encrypts with ire-ebs-cmk)
+  4. Verify copy complete
+
+PROD Account
+  5. Revoke AMI share (ec2:ModifyImageAttribute)
+
+IRE-Core Account owns final AMI — PROD cannot modify or delete it
+```
 
 ---
 
-## Performance Considerations
+## 6. KMS Key Design
 
-- **RTO Target**: ≤ 4 hours for P1 incidents (full IRE activation and workload restoration)
-- **RPO Target**: ≤ 24 hours (daily backup cycle, near-real-time replication for Tier-1 workloads)
-- **Backup Replication Throughput**: Up to 10 Gbps via TGW (burst), 1 Gbps sustained
-- **Step Functions concurrency**: Parallel restore jobs for independent workloads (fan-out up to 40 concurrent executions)
-- **Pre-warmed AMIs**: Golden AMIs for common OS/runtime configurations stored in IRE Vault, reducing provisioning time by ~60%
-- **Aurora Snapshot Restore**: RDS Aurora clusters restore to new cluster in ~10 minutes for databases ≤ 500 GB
+| Key Alias | Account | Purpose | Key Policy Principals |
+|---|---|---|---|
+| `alias/ire-ebs-cmk` | IRE-Core | EBS volume encryption | IRE-RecoveryAdmin-Role, EC2 service |
+| `alias/ire-s3-cmk` | IRE-Core | S3 bucket encryption | IRE-SecurityAdmin-Role, S3 service, BackupRole (PROD replication only — encrypt) |
+| `alias/ire-backup-cmk` | IRE-Core | AWS Backup vault | IRE-SecurityAdmin-Role, AWS Backup service |
+| `alias/ire-secrets-cmk` | IRE-Core | Secrets Manager | IRE-RecoveryAdmin-Role, Secrets Manager service |
+| `alias/ire-log-cmk` | IRE-Security | CloudTrail, CloudWatch Logs | IRE-SecurityAdmin-Role, CloudTrail service, CW Logs service |
+
+**Universal Key Policy Deny Statement (applied to all IRE CMKs):**
+```json
+{
+  "Sid": "DenyPRODDRAccess",
+  "Effect": "Deny",
+  "Principal": "*",
+  "Action": "kms:*",
+  "Resource": "*",
+  "Condition": {
+    "StringEquals": {
+      "aws:PrincipalAccount": ["<PROD-Account-ID>", "<DR-Account-ID>"]
+    }
+  }
+}
+```
 
 ---
 
-## Dependencies
+## 7. Security Monitoring Design
 
-| Dependency | Purpose | Owner |
+### 7.1 GuardDuty Configuration
+
+```
+IRE-Security Account: GuardDuty Delegated Administrator
+  Member Accounts: IRE-Core
+  Features enabled:
+    - S3 Protection
+    - EKS Audit Logs (if applicable)
+    - EC2 Malware Protection
+    - RDS Login Activity (if applicable)
+  Findings export: S3 bucket in IRE-Security (ire-gd-findings-<acct>)
+  Findings retention: 90 days in GuardDuty + S3 export
+```
+
+### 7.2 Security Hub Configuration
+
+```
+IRE-Security Account: Security Hub Aggregator
+  Member Accounts: IRE-Core
+  Standards enabled:
+    - AWS Foundational Security Best Practices (FSBP)
+    - CIS AWS Foundations Benchmark v1.4
+  Custom Insights:
+    - "IRE Network Isolation" — tracks IGW/TGW/NAT GW config findings
+    - "IRE Identity Findings" — tracks IAM anomalies
+  Findings export: EventBridge → SNS → IRE on-call
+```
+
+### 7.3 CloudTrail Configuration
+
+```
+Trail Name: IRE-OrganizationTrail
+Scope: IRE OU (IRE-Core + IRE-Security)
+Log destination: s3://ire-cloudtrail-logs-<IRE-Security-acct-id>/
+Encryption: ire-log-cmk
+CloudWatch Logs: /aws/cloudtrail/IRE  (in IRE-Security)
+Object Lock: Governance mode, 365 days
+Multi-region: Yes
+Management Events: All (Read + Write)
+Data Events:
+  - S3: Write events on ire-backup-data-* buckets
+  - Lambda: All invocations (if applicable)
+
+Bucket Policy:
+  Allow: arn:aws:sts::*:assumed-role/cloudtrail-service/*
+  Deny:  s3:DeleteObject from *
+  Deny:  s3:PutBucketPolicy from non-IRE-Security accounts
+```
+
+### 7.4 AWS Config Rules
+
+| Rule Name | Type | Check |
 |---|---|---|
-| AWS Organizations | Multi-account management and SCPs | Cloud Platform Team |
-| AWS Identity Center | SSO and Permission Sets for both orgs | Identity & Access Team |
-| AWS Backup | Backup plan execution and vault management | Platform/Operations |
-| AWS Transit Gateway | Cross-org network connectivity | Network Team |
-| AWS KMS (Customer Managed Keys) | Encryption for backups and secrets | Security Team |
-| AWS Step Functions | IRE activation workflow orchestration | Platform Engineering |
-| AWS Secrets Manager | JIRA and ADO credentials storage/rotation | Security Team |
-| Atlassian JIRA | Incident tracking and workflow status | IT Service Management |
-| Azure DevOps | CI/CD pipeline for clean builds | DevOps Team |
-| Corporate IdP (Azure AD/Okta) | SAML 2.0 identity provider for SSO | Identity & Access Team |
-| Terraform (IaC) | Infrastructure as Code for all resources | Platform Engineering |
-| AWS Config + Security Hub | Compliance monitoring and alerting | Security Team |
+| `ire-no-igw` | Custom | No IGW attached to IRE VPCs |
+| `ire-no-tgw-attachment` | Custom | No TGW VPC attachments exist |
+| `ire-no-vpc-peering` | Custom | No VPC peering connections |
+| `ire-s3-object-lock-enabled` | Managed | S3 Object Lock on all IRE buckets |
+| `ire-kms-rotation-enabled` | Managed | KMS key rotation enabled |
+| `ire-guardduty-enabled` | Managed | GuardDuty active in all IRE accounts |
+| `ire-cloudtrail-enabled` | Managed | CloudTrail active |
+| `ire-mfa-enabled-for-iam-access` | Managed | MFA on all console users |
+| `ire-encrypted-volumes` | Managed | All EBS volumes encrypted |
+
+### 7.5 Alerting Architecture
+
+```
+EventBridge (IRE-Security) ──► SNS Topic: ire-security-alerts
+  Rules:
+    - GuardDuty finding severity >= HIGH
+    - Root account login (CloudTrail event)
+    - Break-glass role assumption (CloudTrail: AssumeRoleWithSAML)
+    - SCP violation attempt (CloudTrail: AccessDenied on SCP-blocked actions)
+    - Config rule NON_COMPLIANT transition
+
+SNS Subscriptions:
+  - IRE Recovery Admin email distribution list
+  - IRE Security team email distribution list
+  - Dedicated PagerDuty integration (NOT shared with PROD PagerDuty)
+```
 
 ---
 
-## Correctness Properties
+## 8. SaaS Replacement Design
 
-These properties define invariants that must hold at all times across the IRE system. They are suitable as property-based test targets and as compliance assertions in automated checks.
+### 8.1 CrowdStrike → Amazon GuardDuty
 
-### Property 1: Vault Immutability
+| CrowdStrike Capability | AWS Replacement | Notes |
+|---|---|---|
+| Host-based threat detection | GuardDuty EC2 findings | Network-level; no agent required |
+| Malware detection | GuardDuty Malware Protection | On-demand EBS scan |
+| Process/file telemetry | GuardDuty Runtime Monitoring | Agent-based optional feature (AWS-managed agent only) |
 
-For all backup records `b` in the IRE Vault:
-- `b.locked = TRUE` must always hold after initial write
-- No process in any Production Org account can delete or modify `b`
-- `b.retentionExpiresAt >= b.completedAt + 90 days` must always hold
+### 8.2 Qualys → Amazon Inspector v2
 
-### Property 2: Network Isolation
+| Qualys Capability | AWS Replacement | Notes |
+|---|---|---|
+| OS vulnerability scanning | Inspector v2 EC2 scanning | Agentless (SSM-based) |
+| Package CVE detection | Inspector v2 | Integrated with NVD/CVE feeds |
+| Container image scanning | Inspector v2 ECR scanning | Registry-level scanning |
 
-For all network paths `p` originating from any IRE Recovery VPC subnet:
-- No path `p` reaches any Production workload subnet (10.0.1.0/24 - 10.0.3.0/24)
-- The only permitted cross-org path is from Production Backup Subnet (10.0.10.0/28) to IRE Vault Subnet (172.16.1.0/24)
-- All other cross-org traffic is denied at TGW route table level
+### 8.3 Tanium → AWS Systems Manager
 
-### Property 3: Identity — No Long-Lived Credentials
+| Tanium Capability | AWS Replacement | Notes |
+|---|---|---|
+| Patch management | SSM Patch Manager | Patch baselines, maintenance windows |
+| Remote command execution | SSM Run Command | Audited via CloudTrail |
+| Inventory | SSM Inventory | Software/config inventory |
+| Compliance reporting | SSM Compliance | Patch compliance dashboard |
 
-For all IAM principals in both organizations:
-- No IAM user with console or programmatic access exists (SSO-only enforced via SCP)
-- No IAM access key with `age > 0 days` exists in any account
-- All human sessions are bounded by `sessionDuration <= 1 hour`
+### 8.4 Rubrik → AWS Backup + S3 Replication
 
-### Property 4: IRE Activation Status Monotonicity
+| Rubrik Capability | AWS Replacement | Notes |
+|---|---|---|
+| Backup copy to isolated store | AWS Backup cross-account copy | Vault Lock for immutability |
+| File-level recovery | EBS snapshot restore | Granularity depends on snapshot frequency |
+| Immutable backup | S3 Object Lock + Vault Lock | Compliance-mode immutability |
 
-For any IRE activation workflow execution `e`:
-- The status sequence must be strictly: `INITIATED -> VALIDATING -> PROVISIONING -> DEPLOYING -> READY`
-- A transition to `FAILED` is terminal — no forward transitions from `FAILED` without a new execution
-- No status can regress to an earlier state within the same execution
+---
 
-### Property 5: Backup Integrity Before Restore
+## 9. Service Control Policies (Full Specification)
 
-For all restore operations `r` triggered during IRE activation:
-- `r` can only proceed if `ValidateBackupIntegrity(r.backup) = TRUE`
-- If any validation in a batch returns `FALSE`, the entire activation halts
-- This property holds regardless of the number of resources being restored
+### SCP-01: `IRE-DenyNetworkExposure`
 
-### Property 6: Least-Privilege Access Grants
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyIGW",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:AttachInternetGateway",
+        "ec2:CreateInternetGateway"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyNATGW",
+      "Effect": "Deny",
+      "Action": ["ec2:CreateNatGateway"],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyVPCPeering",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:CreateVpcPeeringConnection",
+        "ec2:AcceptVpcPeeringConnection"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyTGW",
+      "Effect": "Deny",
+      "Action": [
+        "ec2:CreateTransitGatewayVpcAttachment",
+        "ec2:AcceptTransitGatewayVpcAttachment"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyRAMFromNonIRE",
+      "Effect": "Deny",
+      "Action": ["ram:AcceptResourceShareInvitation"],
+      "Resource": "*",
+      "Condition": {
+        "StringNotLike": {
+          "aws:PrincipalArn": "arn:aws:iam::*:role/IRE-*"
+        }
+      }
+    }
+  ]
+}
+```
 
-For all Permission Set assignments `a` targeting the IRE Recovery Account:
-- `a.justification` is non-empty and contains a valid JIRA ticket reference
-- `a.expiresAt` is set and `a.expiresAt <= a.grantedAt + 8 hours`
-- Assignment creation emits a CloudTrail event with all required fields
+### SCP-02: `IRE-DenySecurityDisablement`
 
-### Property 7: Audit Trail Completeness
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyDisableGuardDuty",
+      "Effect": "Deny",
+      "Action": [
+        "guardduty:DeleteDetector",
+        "guardduty:DisassociateFromMasterAccount",
+        "guardduty:StopMonitoringMembers",
+        "guardduty:DisableOrganizationAdminAccount"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyDisableCloudTrail",
+      "Effect": "Deny",
+      "Action": [
+        "cloudtrail:DeleteTrail",
+        "cloudtrail:StopLogging",
+        "cloudtrail:UpdateTrail"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyDisableSecurityHub",
+      "Effect": "Deny",
+      "Action": [
+        "securityhub:DisableSecurityHub",
+        "securityhub:DisassociateMembers",
+        "securityhub:DeleteMembers"
+      ],
+      "Resource": "*"
+    },
+    {
+      "Sid": "DenyDisableConfig",
+      "Effect": "Deny",
+      "Action": [
+        "config:DeleteConfigurationRecorder",
+        "config:StopConfigurationRecorder",
+        "config:DeleteDeliveryChannel"
+      ],
+      "Resource": "*"
+    }
+  ]
+}
+```
 
-For all mutating API calls `c` across all IRE accounts:
-- A corresponding CloudTrail event exists in the IRE Log Archive account
-- Log file integrity digest for `c`'s time window is present and valid
-- VPC Flow Log entry exists for all network-layer events associated with `c`
+### SCP-03: `IRE-DenyIdentityMutation`
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DenyIdCChangesFromNonSecurityAdmin",
+      "Effect": "Deny",
+      "Action": [
+        "sso:DeletePermissionSet",
+        "sso:DetachManagedPolicyFromPermissionSet",
+        "sso:DeleteAccountAssignment",
+        "sso:DisableUser",
+        "sso:DeleteUser"
+      ],
+      "Resource": "*",
+      "Condition": {
+        "StringNotEquals": {
+          "aws:PrincipalAccount": "<IRE-Security-Account-ID>"
+        }
+      }
+    }
+  ]
+}
+```
+
+---
+
+## 10. Infrastructure as Code (IaC) Strategy
+
+- All IRE infrastructure defined in **Terraform** (or AWS CDK)
+- IRE IaC stored in a **dedicated Git repository** with no access from PROD CI/CD pipelines or PROD IAM roles
+- Deployment pipeline uses an IRE-specific IAM role (`IRE-TerraformDeployRole`) with trust only to IRE Identity Center
+- State backend: S3 bucket in `IRE-Security` account, encrypted with `ire-s3-cmk`
+- State lock: DynamoDB table in `IRE-Security` account
+
+---
+
+## 11. Architecture Decision Records (ADRs)
+
+### ADR-001: Standalone IAM Identity Center vs. PROD IdC Delegation
+**Decision:** Standalone IAM Identity Center with local identity store  
+**Rationale:** PROD IdC federated to Microsoft AD means a compromised AD controls all federated identities. A standalone instance with local users and hardware MFA severs this dependency. The operational overhead of managing local users is acceptable given the IRE is activated infrequently.  
+**Alternatives Rejected:** PROD IdC delegation (shares AD trust chain), separate AWS SSO (same service, same concern).
+
+### ADR-002: No NAT Gateway or Internet Gateway
+**Decision:** IRE VPC has no internet path of any kind  
+**Rationale:** All four SaaS tools (Rubrik, CrowdStrike, Qualys, Tanium) require outbound internet to function. Removing internet egress eliminates SaaS callback surface. AWS-native replacements operate entirely via PrivateLink endpoints.  
+**Alternatives Rejected:** Network Firewall with FQDN blocklist (complex, operational burden, risk of misconfiguration bypassing the block).
+
+### ADR-003: Push-only data replication from PROD to IRE
+**Decision:** S3 replication and AWS Backup cross-account copy use push-from-PROD model  
+**Rationale:** If IRE could pull from PROD, a compromised IRE could exfiltrate PROD data. One-way push limits blast radius in both directions.  
+**Alternatives Rejected:** IRE-initiated pull (bidirectional trust concern), AWS DataSync (requires network path between accounts).
+
+### ADR-004: AWS-Native Security Tooling in IRE
+**Decision:** GuardDuty, Inspector v2, SSM replace CrowdStrike, Qualys, Tanium  
+**Rationale:** SaaS security agents require internet connectivity and are managed from PROD consoles. In a compromise scenario, PROD SaaS consoles may be under adversary control. AWS-native services operate within the AWS control plane accessible via PrivateLink.  
+**Alternatives Rejected:** Offline/disconnected agent mode for CrowdStrike (still requires periodic check-in; complex to configure and maintain).
